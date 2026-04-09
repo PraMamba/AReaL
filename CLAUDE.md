@@ -168,3 +168,31 @@ Project-wide standards enforced across all code changes:
 - `code-style.md` - Coding conventions beyond pre-commit hooks
 - `distributed.md` - Distributed training patterns and constraints
 - `testing.md` - Testing strategy and coverage requirements
+
+## Code Intelligence & Navigation
+
+When navigating and understanding code:
+
+1. **ALWAYS prefer LSP tools over text search for code relationships**:
+
+   - Use `goToDefinition` to jump to symbol definitions
+   - Use `findReferences` to find all usages across the codebase
+   - Use `goToImplementation` for interfaces/abstract methods
+   - Use `workspaceSymbol` to search symbols across entire project
+   - Use `getDiagnostics` to check for type errors when relevant
+
+1. **Use Grep/Glob/Read ONLY for**:
+
+   - Text/pattern searches in comments or strings
+   - Searching configuration files (JSON, YAML, etc.)
+   - Exploratory "fuzzy" searches when unsure what you're looking for
+   - Finding files by name patterns
+
+1. **Workflow**:
+
+   - First: Use LSP to understand code structure and relationships
+   - Second: Use text tools only when LSP cannot help (non-code content)
+   - NEVER read entire large files to find references; use LSP instead
+
+Remember: LSP provides semantic understanding (types, inheritance, references), while
+grep only provides text matching.
