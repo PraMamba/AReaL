@@ -203,3 +203,4 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+.omx/
