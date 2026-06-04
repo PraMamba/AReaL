@@ -1,26 +1,43 @@
-AReal: [https://github.com/inclusionAI/AReaL](https://github.com/inclusionAI/AReaL)
+# AReaL: [https://github.com/inclusionAI/AReaL](https://github.com/inclusionAI/AReaL)
 
 # 1. 简介
 
-Archon 是一个基于 PyTorch 原生分布式 API 构建的大规模 Transformer 模型训练框架，专为百亿至千亿参数规模的语言模型训练设计。它继承并扩展了
-torchtitan （pytorch团队自己推出的训练框架，设计也极其优雅，推荐源码阅读）的设计哲学，包含纯 PyTorch 原生实现，深度集成
-torch.distributed、DeviceMesh、DTensor 等现代分布式原语，针对 Qwen2 和 Qwen3（含 MoE
-架构）模型进行了深度优化，支持多种先进并行策略的组合使用。
+Archon 是一个基于 PyTorch 分布式 API 构建的大规模 Transformer 模型训练框架，专为百亿至千亿参数规模的语言模型训练设计。它继承并扩展了
+Torchtitan 的设计哲学，深度集成 torch.distributed、DeviceMesh、DTensor 等现代分布式原语；同时在 MoE、变长 Flash
+Attention、FP8 等路径中使用少量 Triton kernel 与 `torch.library.custom_op` 包装。因此更准确的表述是：Archon 以
+PyTorch 原生分布式抽象为主体，而不是完全没有 custom op/kernel 的“纯 PyTorch”实现。
 
-在本文中我们（1）在section2中分析Archon的架构设计（为什么会以这样的结构设计？）（2）在section3中深入研究各个核心模块的实现细节（3）在section4中探讨关键技术创新点（4）在section5中总结代码质量与工程实践。
+截至当前源码，Archon 注册了 Qwen2、Qwen3（含 MoE）和 Qwen3.5/Qwen3.5-MoE 三类模型规格，但三者的并行能力并不完全等价：Qwen2 支持
+TP/CP/AC/compile/FSDP，Qwen3 在此基础上支持 MoE EP/ETP，Qwen3.5 目前主要是 AC/compile/FSDP 路径，TP/CP/EP
+请求会被 warning 并忽略。
+
+在本文中我们（1）在 section 2 中分析 Archon 的架构设计（为什么会以这样的结构设计？）（2）在 section 3 中深入研究各个核心模块的实现细节（3）在
+section 4 中探讨关键技术创新点（4）在 section 6 中总结代码质量与工程实践。
 
 ______________________________________________________________________
+
+## 1.1 源码校准摘要（2026-05-15）
+
+| 主题             | 当前源码证据                                                                                                                     | 本文采用的校准                                         |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 模型注册         | `archon/__init__.py` 同时导入 `qwen2`、`qwen3`、`qwen3_5` spec；`qwen3_5/spec.py` 注册 `QWEN3_5_SPEC`                            | 不再只写 Qwen2/Qwen3；补充 Qwen3.5 caveat              |
+| Qwen2 并行顺序   | `qwen2/infra/parallelize.py` 文档和实现为 TP -> CP -> AC -> compile -> FSDP                                                      | Qwen2 分析限定为 dense/非 MoE 路径                     |
+| Qwen3 并行顺序   | `qwen3/infra/parallelize.py` 为 non-MoE TP -> `apply_moe_ep_tp` -> CP -> AC -> compile -> FSDP                                   | EP/ETP 发生在 FSDP 前，且入口不是 `apply_ep`           |
+| Qwen3.5 并行能力 | `qwen3_5/infra/parallelize.py` 对 TP/CP/EP 打 warning 并忽略，只应用 AC/compile/FSDP                                             | 将 Qwen3.5 标为已注册但非 full-parallel feature parity |
+| CP/Ulysses       | attention 内部 `gather_seq_scatter_heads`/`gather_heads_scatter_seq`；engine 侧切分 inputs/labels，并收集 logprobs/entropy/value | 不再描述为 raw output 的统一 gather                    |
+| AC memory_budget | `activation_checkpoint.py` 只设置 functorch config，要求 compile，不像 full/selective 那样逐层 wrapper                           | 单独标注 memory_budget 行为                            |
+| custom op/kernel | `attention/varlen.py` 定义 `torch.library.custom_op`；MoE kernels 使用 Triton；FP8 路径可选 Triton GEMM                          | 避免“纯 PyTorch/无 custom op”过度表述                  |
 
 # 2. 架构设计哲学
 
 ## 2.1 分层解耦的并行策略架构
 
-Archon 的核心设计思想是**将不同的并行策略解耦为独立的可组合模块**，而非传统框架中的紧耦合实现（没法对齐，超级无敌爆怒）：
+Archon 的核心设计思想是**将不同的并行策略解耦为独立的可组合模块**，避免把 TP、CP、PP、FSDP、EP/ETP 写成单一不可拆分的训练路径：
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │                      模型层 (Model Layer)                      │
-│              Qwen2Model / Qwen3Model (含 MoE)                  │
+│       Qwen2Model / Qwen3Model (含 MoE) / Qwen3_5Model            │
 ├─────────────────────────────────────────────────────────────┤
 │                   并行化层 (Parallelization)                    │
 │   TP (Tensor Parallel)  +  CP (Ulysses SP)  +  AC (Checkpoint)  │
@@ -36,7 +53,10 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**核心洞察**：每一层都通过标准化的接口与上下层交互，使得任意组合成为可能。例如，你可以独立选择是否使用 PP、TP、CP，它们的组合不需要彼此感知。
+**源码校准后的核心洞察**：每一层尽量通过标准化接口与上下层交互，使常见组合（如 TP+CP+FSDP、Qwen3 的 TP+EP/ETP+CP+FSDP、PP 切分后的逐
+part parallelize）可维护。 但“任意组合”并不成立：`ArchonParallelDims.__post_init__` 对
+`dp_shard*tp*cp*pp==world_size`、`etp in {1,tp}`、EP 与 CP/TP/DP 的整除关系都有硬约束；pipeline
+schedule 也要求虚拟 stage 数与 pp_degree、schedule 类型匹配。
 
 ## 2.2 整体调用分析
 
@@ -61,7 +81,12 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
 │         │                                     ▼                             │
 │         │                        _MODEL_SPECS["qwen2"] = QWEN2_SPEC           │
 │         │                                                                   │
-│         └─── from .qwen3 import spec ──► qwen3/spec.py (同上)               │
+│         ├─── from .qwen3 import spec ──► qwen3/spec.py (同上)               │
+│         │                                                                   │
+│         └─── from .qwen3_5 import spec ──► qwen3_5/spec.py                  │
+│                                               │                             │
+│                                               ▼                             │
+│                                  QWEN3_5_SPEC 注册                         │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -188,9 +213,11 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
 │  │    module_names_per_stage = generate_llm_fqn_per_model_part(     │         │
 │  │        num_stages=8, num_layers=32                               │         │
 │  │    )                                                             │         │
-│  │    # 例: [['tok_embeddings', 'layers.0', 'layers.1', 'layers.2'], │         │
-│  │    #      ['layers.3', 'layers.4', 'layers.5'],                  │         │
-│  │    #      ...]                                                    │         │
+│  │    # 例 (num_stages=8, num_layers=32, first/last=1):              │         │
+│  │    # stage0: tok_embeddings + layers.0..3                        │         │
+│  │    # stage1: layers.4..8                                          │         │
+│  │    # stage2-6: each has 4 transformer layers                      │         │
+│  │    # stage7: layers.29..31 + norm + output/score                  │         │
 │  │                                                                 │         │
 │  │ 3. 分割模型                                                       │         │
 │  │    stages, model_parts = pipeline_module_split(                  │         │
@@ -227,7 +254,7 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    阶段 4: 并行化应用 (核心: parallelize_qwen2)               │
+│             阶段 4: 并行化应用 (Qwen2/Qwen3/Qwen3.5 路径不同)                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  def parallelize_qwen2(model, parallel_dims, ...):                          │
@@ -324,23 +351,22 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
 │                                    │                                         │
 │                                    ▼                                         │
 │      ┌─────────────────────────────────────────────────────────────────┐     │
-│      │ 步骤 6: Expert Parallelism (MoE 模型)                            │     │
-│      │ ─────────────────────────────────                               │     │
-│      │ if parallel_dims.ep_enabled:                                    │     │
-│      │     # 在 qwen3/parallelize.py 中处理                             │     │
-│      │     apply_ep(model, ep_mesh, tp_mesh, etp_enabled)              │     │
-│      │         │                                                       │     │
-│      │         ▼                                                       │     │
-│      │     # 根据 ETP 配置选择策略                                      │     │
-│      │     if etp == tp:                                               │     │
-│      │         ep_tp_mesh = parallel_dims.get_mesh("ep_tp")            │     │
-│      │         ExpertTensorParallel()._apply(experts, ep_tp_mesh)      │     │
-│      │     else:                                                       │     │
-│      │         apply_expert_parallel(experts, ep_mesh)                 │     │
+│      │ Qwen3 MoE 专用步骤: apply_moe_ep_tp（发生在 CP/AC/FSDP 之前）      │     │
+│      │ ─────────────────────────────────────────────────────────────   │     │
+│      │ # qwen3/infra/parallelize.py: parallelize_qwen3                  │     │
+│      │ apply_non_moe_tp(model, tp_mesh)                                │     │
+│      │ if tp_mesh is not None or ep_mesh is not None:                  │     │
+│      │     apply_moe_ep_tp(model, tp_mesh, ep_mesh, etp, ep_tp_mesh)   │     │
 │      │                                                                 │     │
-│      │     # 使用 distribute_module 自动注册 hooks:                    │     │
-│      │     # - forward_pre: _token_dispatch (All-to-All)               │     │
-│      │     # - forward:     _token_combine (All-to-All 反向)            │     │
+│      │ # apply_moe_ep_tp 根据 ETP 配置选择策略：                         │     │
+│      │ if etp == tp:                                                   │     │
+│      │     ExpertTensorParallel()._apply(experts, ep_tp_mesh)          │     │
+│      │ else:                                                           │     │
+│      │     apply_expert_parallel(experts, ep_mesh)                     │     │
+│      │                                                                 │     │
+│      │ # 使用 distribute_module 自动注册 hooks:                         │     │
+│      │ # - forward_pre: _token_dispatch (All-to-All)                   │     │
+│      │ # - forward:     _token_combine (All-to-All 反向)                │     │
 │      └─────────────────────────────────────────────────────────────────┘     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -400,17 +426,19 @@ Archon 的核心设计思想是**将不同的并行策略解耦为独立的可�
 │  # 或者非 PP 场景                                                             │
 │  ───────────────                                                            │
 │  for batch in dataloader:                                                   │
-│      # Ulysses SP: 切分输入序列                                               │
+│      # CP/Ulysses: engine 先切分 input_ids/labels                            │
 │      inputs, labels = ulysses_slice_inputs(inputs, labels, cp_rank, cp_size)│
 │                                                                             │
-│      # 前向传播                                                               │
-│      output = model(tokens, positions, cu_seqlens, max_seqlen)              │
+│      # 前向传播：attention 内部执行 gather_seq_scatter_heads 和反向变换         │
+│      logits = model(tokens, positions, cu_seqlens, max_seqlen)              │
 │                                                                             │
-│      # Ulysses SP: 收集输出                                                  │
-│      output = ulysses_gather_output(output, cp_group)                       │
+│      # engine 收集的是 logprobs/entropy/vocab stats 或 critic values，         │
+│      # 不是无条件收集 raw logits/output                                      │
+│      logprobs = gather_logprobs(logits, labels, tp_group)                   │
+│      logprobs = ulysses_gather_output(logprobs, cp_group)                   │
 │                                                                             │
 │      # 计算损失 & 反向传播                                                     │
-│      loss = loss_fn(output, labels)                                         │
+│      loss = loss_fn(logprobs, labels)                                       │
 │      loss.backward()                                                        │
 │                                                                             │
 │      # 优化器步进                                                             │
@@ -442,7 +470,8 @@ import areal.experimental.models.archon
     │       │
     │       └───► qwen2/spec.py ──► 注册 QWEN2_SPEC
     │       │
-    │       └───► qwen3/spec.py ──► 注册 QWEN3_SPEC
+    │       ├───► qwen3/spec.py ──► 注册 QWEN3_SPEC
+    │       └───► qwen3_5/spec.py ──► 注册 QWEN3_5_SPEC
     │
     └───► (其他模块)
 ```
@@ -451,6 +480,8 @@ import areal.experimental.models.archon
 
 ```text
 parallelize_qwen2(model, parallel_dims, ...)
+    │
+    │   # Qwen2 顺序: TP -> CP -> AC -> compile -> FSDP
     │
     ├───► apply_tp(model, tp_mesh)
     │       │
@@ -481,6 +512,24 @@ parallelize_qwen2(model, parallel_dims, ...)
     └───► apply_fsdp(model, dp_mesh)
             │
             └───► fully_shard()  # FSDP2 逐层包裹
+
+parallelize_qwen3(model, parallel_dims, ...)
+    │
+    │   # Qwen3 顺序: non-MoE TP -> MoE apply_moe_ep_tp -> CP -> AC -> compile -> FSDP
+    │   # 注意源码中不存在 apply_ep(...)；MoE 入口是 apply_moe_ep_tp(...)
+    ├───► apply_non_moe_tp(model, tp_mesh)
+    ├───► apply_moe_ep_tp(model, tp_mesh, ep_mesh, etp, ep_tp_mesh)
+    ├───► apply_cp(model, cp_group)
+    ├───► apply_ac(model, ac_config)
+    ├───► _apply_compile(model, ep_enabled=parallel_dims.ep > 1)
+    └───► apply_fsdp(model, dp_mesh, dp_mod_ep_mesh=...)
+
+parallelize_qwen3_5(model, parallel_dims, ...)
+    │
+    │   # 当前源码明确 warning：TP/CP/EP not yet supported and ignored
+    ├───► apply_ac(model, ac_config)        # if configured
+    ├───► _apply_compile(model)             # if enabled
+    └───► apply_fsdp(model, dp_mesh)
 ```
 
 ## 2.2.3 专家并行调用链 (MoE + EP Chain)
@@ -696,6 +745,104 @@ EP 与 TP 的资源分配是动态协商的：
 - 当 `etp=1` 时，TP 维度被 EP “借用” 用于 token dispatch
 - 当 `etp=tp` 时，EP 与 TP 正交，expert 权重使用 2D sharding `[Shard(0), Shard(1/2)]`
 
+### 4.1.1.1 为什么需要 ETP，以及为什么区分 `etp=1` / `etp=tp`
+
+先给结论：**ETP 不是额外增加一份 world size 的新并行轴，而是 MoE expert 层里“TP 轴如何被使用”的策略开关**。当 `EP>1` 且
+`TP>1` 时，同一批 GPU 维度同时面对两个互斥诉求：
+
+1. **专家归属与 token dispatch**：把不同 expert 放到不同 rank 上，token 需要通过 All-to-All 发到持有目标 expert 的
+   rank；这对应 EP，expert 权重按第 0 维切分，即 `Shard(0)`。
+1. **单个 expert 内部矩阵切分**：如果单个 expert 的 FFN 权重仍然很大，希望继续像 dense FFN 一样在矩阵维度上做 TP；这对应
+   ETP/TP，`w1/w3` 按 `Shard(1)` 切，`w2` 按 `Shard(2)` 切。
+
+`etp` 的存在就是为了显式回答这个问题：**TP 这条轴到底被折叠进 EP dispatch 组，还是保留下来作为 expert 内部 tensor parallel
+轴？** AReaL 当前只支持两个稳定形态：`etp=1` 或 `etp=tp`，源码在 `ArchonParallelDims.__post_init__`
+中直接拒绝中间值；这避免出现“部分 TP rank 参与 expert 权重切分、部分 TP rank 又参与 dispatch”的混合拓扑，降低 DTensor
+placement、All-to-All split 和 grouped GEMM 对齐的复杂度。
+
+#### 情况一：`etp=1` —— TP 轴被 EP 借用做 token dispatch
+
+`etp=1` 不表示整个模型的 TP 被关闭；dense attention / dense FFN 仍然可以走普通 TP。它只表示 **MoE expert 权重本身不再做
+tensor parallel 切分**。在 EP mesh 构建上，Archon 把 `tp` 轴折叠进 `ep`：
+
+```text
+etp = 1:
+  ep = flatten(dp_shard_in_ep, cp, tp)
+  dp_shard_mod_ep = dp_shard * cp * tp / ep
+  dp_shard_in_ep  = ep / (cp * tp)
+```
+
+所以这里的“TP 被 EP 借用”更精确地说是：**TP rank 不再保存同一个 expert 的不同矩阵切片，而是作为更多 EP rank 参与 MoE token
+routing / All-to-All**。expert 权重只按 expert 维度切：
+
+```text
+expert weights: [Shard(0)]
+```
+
+这一路径在 `apply_moe_ep_tp()` 中会选择 `ExpertParallel()`，而不是 `ExpertTensorParallel()`。同时，为了避免每个
+TP rank 都 dispatch 同一批 routed tokens，Archon 会在 `etp=1` 且 EP 开启时给 `moe.reorderer` 套上
+`ReordererSequenceParallel`：它把 tokens 沿序列/token 维切成 `tp` 份，让不同 TP rank 处理不同 token 子集，并在
+reorderer 输出阶段把局部 token index 调整回全局 index。这样后续 EP All-to-All 看到的是分片后的 routed tokens，而不是
+TP rank 间重复的 token 数据。
+
+#### 情况二：`etp=tp` —— EP 与 TP 正交，expert 权重做 2D sharding
+
+`etp=tp` 表示 **TP 轴保留下来作为 expert 内部 tensor parallel 轴**。此时 EP mesh 不包含 `tp`：
+
+```text
+etp = tp:
+  ep    = flatten(dp_shard_in_ep, cp)
+  ep_tp = mesh["ep", "tp"]
+  dp_shard_mod_ep = dp_shard * cp / ep
+  dp_shard_in_ep  = ep / cp
+```
+
+`ep_tp` 是一个二维 mesh：第一维是 expert parallel，第二维是 tensor parallel。因此 expert 权重的 placement
+也是二维的：
+
+```text
+w1: [Shard(0), Shard(1)]   # expert 维 + column/hidden 维
+w2: [Shard(0), Shard(2)]   # expert 维 + row/output 维
+w3: [Shard(0), Shard(1)]   # expert 维 + column/hidden 维
+```
+
+文档中把它简写为 `[Shard(0), Shard(1/2)]`：`Shard(0)` 表示按 expert 编号切分，`Shard(1/2)` 表示 TP
+维根据具体矩阵形状切 `w1/w3` 的第 1 维或 `w2` 的第 2 维。由于 TP rank 持有的是同一 expert 的不同权重切片，它们需要看到同一批 routed
+tokens 的不同矩阵分片计算结果；因此这里不再使用 `ReordererSequenceParallel` 去把 token 分给不同 TP rank，而是在
+`ExpertTensorParallel._token_dispatch()` 中先把 routed input 在 TP mesh 上标记为 replicated /
+partial-gradient，再只沿 EP mesh 做 All-to-All dispatch / combine。
+
+#### 为什么必须区分 `ETP=1` 与 `ETP=TP`
+
+| 对比项                               | `etp=1`                                         | `etp=tp`                                                |
+| ------------------------------------ | ----------------------------------------------- | ------------------------------------------------------- |
+| TP 在 MoE expert 层的角色            | 被折叠进 EP dispatch 组                         | 保持为 expert 内部 TP 轴                                |
+| `ep` 来源                            | `dp_shard_in_ep × cp × tp`                      | `dp_shard_in_ep × cp`                                   |
+| 是否创建 `ep_tp`                     | 否                                              | 是，`mesh["ep", "tp"]`                                  |
+| expert 权重 placement                | `[Shard(0)]`                                    | `w1/w3=[Shard(0), Shard(1)]`, `w2=[Shard(0), Shard(2)]` |
+| token 行为                           | TP rank 处理不同 token 子集，避免 dispatch 重复 | TP rank 处理同一 routed token 的不同权重切片            |
+| 并行类                               | `ExpertParallel`                                | `ExpertTensorParallel`                                  |
+| 是否需要 `ReordererSequenceParallel` | 需要                                            | 不需要                                                  |
+| 适用直觉                             | 更偏向扩大 EP dispatch / expert 分布范围        | 更偏向降低单个 expert 权重和 GEMM 的显存/计算压力       |
+
+一个小例子可以说明拓扑差异。设 `dp_shard=2, cp=1, tp=2, ep=2`：
+
+- `etp=1`：`ep = dp_shard_in_ep × cp × tp = 1 × 1 × 2`，`tp=2` 被折叠进 1D `ep_mesh`；两个 TP
+  rank 各处理一部分 tokens，expert 权重只做 `[Shard(0)]`。
+- `etp=tp=2`：`ep = dp_shard_in_ep × cp = 2 × 1`，`tp=2` 保持独立，并形成 `ep_tp=[ep=2, tp=2]`；每个
+  expert 先按 expert 维分到不同 EP rank，再在 TP 维上切分内部 FFN 矩阵。
+
+因此，ETP 的核心价值不是“多一种并行名字”，而是把 MoE 场景中 **token 路由并行** 与 **expert 矩阵并行** 的资源归属说清楚：`etp=1`
+选择把 TP 资源让给 dispatch，`etp=tp` 选择把 TP 资源保留给 expert 权重的 2D sharding。
+
+**源码锚点**：`areal/experimental/models/archon/parallel_dims.py` 负责 `etp in {1,tp}` 校验、`ep`
+/ `ep_tp` mesh 构建；`areal/experimental/models/archon/qwen3/infra/parallelize.py` 负责在
+`ExpertParallel` 与 `ExpertTensorParallel` 之间切换，并在 `etp=1` 时启用
+`ReordererSequenceParallel`；`areal/experimental/models/archon/expert_parallel.py` 实现
+`[Shard(0)]` 与 `[Shard(0), Shard(1/2)]` 两类权重
+placement；`areal/experimental/models/archon/moe/moe.py` 解释 reorderer 分片后 token index
+需要保持全局语义。
+
 ## 4.1.2 Mesh 构建核心逻辑
 
 ```text
@@ -745,6 +892,9 @@ def generate_llm_fqn_per_model_part(
 | Interleaved1F1B       | num_stages / pp_degree | 循环分配，rank 0 持有 stage 0,4,8…   |
 | InterleavedZeroBubble | 同上                   | 零气泡优化版本                       |
 | ZBVZeroBubble         | 2                      | V 形分配，rank 0 持有 stage 0 和 N-1 |
+
+源码还导入并在内部 V-style 判断中处理 `ScheduleDualPipeV`，但当前 CLI `pp_schedule` choices 暴露的是
+`1F1B`、`Interleaved1F1B`、`InterleavedZeroBubble`、`ZBVZeroBubble`。
 
 **代码实现亮点**：
 
@@ -820,7 +970,7 @@ output = gather_heads_scatter_seq(output, head_dim=2, seq_dim=1, ...)
 
 **优势**：
 
-1. 直接使用 PyTorch 原生 `all_to_all_single`，无需自定义 CUDA kernel
+1. Ulysses 通信路径直接使用 PyTorch `all_to_all_single`，不需要项目内单独维护 CUDA collective kernel
 1. 与 TP 自然兼容（TP 切分 hidden dim，Ulysses 切分 heads）
 1. 支持 packed sequences（`cu_seqlens` 语义）
 
@@ -935,24 +1085,33 @@ class MoE(nn.Module):
         bs, slen, dim = x.shape
         x_flat = x.view(-1, dim)
 
-        # 1. 路由
+        # 1. 路由；expert_bias 参与 router 打分
         top_scores, selected_indices, num_tokens_per_expert = self.router(x_flat, self.expert_bias)
 
-        # 2. 重排序
+        # 2. 源码会累计 tokens_per_expert；bias 更新本身由外部逻辑负责
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert.float())
+
+        # 3. 重排序；这里会再次得到用于真实 dispatch/expert 计算的 num_per_expert
         top_scores_sorted, token_indices_sorted, num_per_expert = self.reorderer(top_scores, selected_indices)
 
-        # 3. 收集 tokens
+        # 4. 收集 tokens，并按配置决定是否在 expert 前应用 score
         routed_input = x_flat[token_indices_sorted // self.top_k]
+        if self.score_before_experts:
+            routed_input = routed_input.float() * top_scores_sorted.unsqueeze(-1)
 
-        # 4. Expert 计算
+        # 5. Expert 计算
         routed_output = self.experts(routed_input, num_per_expert)
 
-        # 5. 合并结果
-        out_experts = self._combine_outputs(routed_output, top_scores_sorted, token_indices_sorted)
+        # 6. 合并结果；如果没有 score_before_experts，则在合并时用 top_scores 加权
+        out_experts = combine_or_weighted_sum(routed_output, top_scores, token_indices_sorted)
 
-        # 6. Shared experts
+        # 7. Shared experts；Qwen3.5 MoE 还可能有 shared_expert_gate
         if self.shared_experts:
-            out = out_experts + self.shared_experts(x_flat)
+            shared = self.shared_experts(x_flat)
+            if self.shared_expert_gate is not None:
+                shared = sigmoid(self.shared_expert_gate(x_flat)) * shared
+            out = out_experts + shared
         else:
             out = out_experts
 
@@ -1051,13 +1210,13 @@ def _get_custom_policy(meta):
 
 ## 4.6.1 AC 模式详解
 
-| 模式              | 说明                 | 适用场景          |
-| ----------------- | -------------------- | ----------------- |
-| none              | 不启用 AC            | 显存充足          |
-| full              | 每层都 checkpoint    | 极致省显存        |
-| selective (op)    | 选择性保存特定算子   | 平衡性能与显存    |
-| selective (layer) | 每隔 N 层 checkpoint | 简单配置          |
-| memory_budget     | PyTorch 自动规划     | 需要 compile 支持 |
+| 模式              | 说明                       | 适用场景                                                            |
+| ----------------- | -------------------------- | ------------------------------------------------------------------- |
+| none              | 不启用 AC                  | 显存充足                                                            |
+| full              | 每层都 checkpoint          | 极致省显存                                                          |
+| selective (op)    | 选择性保存特定算子         | 平衡性能与显存                                                      |
+| selective (layer) | 每隔 N 层 checkpoint       | 简单配置                                                            |
+| memory_budget     | PyTorch/functorch 自动规划 | 需要 compile 支持；设置全局 `activation_memory_budget`，不逐层 wrap |
 
 ## 4.7 并行化应用顺序 (parallelize.py)
 
@@ -1143,15 +1302,15 @@ ______________________________________________________________________
 self.register_buffer("expert_bias", torch.zeros(num_experts))
 self.register_buffer("tokens_per_expert", torch.zeros(num_experts))
 
-# 训练过程中更新偏置（基于 tokens_per_expert 统计）
+# forward 中只累计 tokens_per_expert；expert_bias 更新需要外部训练/调度逻辑完成
 ```
 
 **与传统方法的对比**：
 
-| 方法          | 机制                | 优缺点                       |
-| ------------- | ------------------- | ---------------------------- |
-| 传统辅助损失  | load balancing loss | 增加梯度复杂度，需调权重系数 |
-| Archon 偏置法 | 直接调整路由分数    | 无额外梯度流，动态适应负载   |
+| 方法          | 机制                           | 优缺点                                                                   |
+| ------------- | ------------------------------ | ------------------------------------------------------------------------ |
+| 传统辅助损失  | load balancing loss            | 增加梯度复杂度，需调权重系数                                             |
+| Archon 偏置法 | `expert_bias` 直接调整路由分数 | 无额外梯度流；源码层只提供 buffer/统计，bias 更新不在 MoE.forward 内完成 |
 
 ## 5.2 自定义 Flash Attention Op
 
@@ -1248,10 +1407,11 @@ ______________________________________________________________________
 
 ## 7.1 架构优势
 
-1. **模块化设计**: 5 种并行策略独立实现，可灵活组合
-1. **原生 PyTorch**: 无需自定义 C++ 扩展，降低维护成本
-1. **HuggingFace 兼容**: 无缝加载/保存 HF 格式 checkpoint
-1. **MoE 原生支持**: 从路由到 expert 计算的端到端优化
+1. **模块化设计**: 5 种并行策略独立实现，但组合受 world-size、EP/ETP、模型能力和 PP schedule 约束
+1. **PyTorch 分布式优先**: 主体基于 DeviceMesh/DTensor/FSDP2，同时在 attention/MoE/FP8 路径使用 selected
+   custom op/Triton kernel
+1. **HuggingFace 兼容**: 通过 ModelSpec 与 state_dict_adapter 加载/保存 HF 格式 checkpoint
+1. **MoE 原生支持**: Qwen3 MoE 从路由到 expert 计算都有端到端优化；Qwen3.5 MoE 当前仍以 FSDP 路径为主
 
 ## 7.2 设计取舍
 
@@ -1266,7 +1426,7 @@ ______________________________________________________________________
 
 - **大规模 MoE 模型训练**（Qwen3-MoE 类架构）
 - **超长序列训练**（Ulysses SP + CP 组合）
-- **多维度并行探索**（灵活配置 TP/CP/PP/EP 组合）
+- **多维度并行探索**（在源码约束允许的范围内配置 TP/CP/PP/EP/ETP 组合）
 
 ## 7.4 代码洞察
 
@@ -1277,7 +1437,9 @@ Archon 的代码体现了**现代 PyTorch 分布式训练的最佳实践**：
 1. **distribute_module 钩子**: 自动注册通信逻辑
 1. **torch.compile 原生支持**: 与现代编译栈深度整合
 
-这是一个**工程成熟度很高**的训练框架，其设计思路和实现细节对构建大规模分布式训练系统具有重要的参考价值。
+由于 Archon 位于 `areal/experimental`，更稳妥的评价是：它已经体现了现代 PyTorch
+分布式训练的多个关键设计模式，但仍存在模型能力不一致、schedule 约束强、EP 路径含少量 CPU metadata 同步、Qwen3.5 TP/CP/EP
+尚未支持等边界。其设计思路和实现细节对构建大规模分布式训练系统具有重要参考价值。
 
 ______________________________________________________________________
 
@@ -1296,8 +1458,11 @@ BaseArchonModel (abstract)
     │   ├── output (nn.Linear) or score (for critic)
     │   └── rope_cache (buffer)
     │
-    └── Qwen3Model (adds MoE support)
-        └── _is_moe_layer() logic for sparse layers
+    ├── Qwen3Model (adds MoE support)
+    │   └── _is_moe_layer() logic for sparse layers
+    │
+    └── Qwen3_5Model (registered; current parallelize path is AC/compile/FSDP-centered)
+        └── supports qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text specs
 
 TransformerBlock
     ├── attention_norm (RMSNorm)
